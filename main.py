@@ -17,7 +17,7 @@ import collections
 from sklearn import metrics
 import h5py
 import scanpy as sc
-from preprocess import read_dataset, normalize
+from preprocess import read_dataset, preprocess # read_dataset, normalize
 import argparse
 from load_dataset import load_dataset
 from model.select_model import select_model
@@ -111,7 +111,7 @@ if __name__ == "__main__":
     x_sd = adata.X.std(0) # Desviación estándar de los genes
     x_sd_median = np.median(x_sd) # Desviación media de los genes 
     print("median of gene sd: %.5f" % x_sd_median)
-    
+    # breakpoint()
     model = select_model(args=args, input_size=input_size)
     # Descomentar para usar PCA
     #sc.tl.pca(adata,  n_comps=32, svd_solver='arpack')

@@ -1,4 +1,5 @@
 import torch
+import pickle
 import torch.nn as nn
 from torch.autograd import Variable
 from torch.nn import Parameter
@@ -59,7 +60,11 @@ class scDCC(nn.Module):
         self._dec_pi = nn.Sequential(nn.Linear(decodeLayer[-1], input_dim), nn.Sigmoid())
 
         self.mu = Parameter(torch.rand(n_clusters, z_dim, dtype=torch.float32)) # Inicialización de los clusters
-        self.zinb_loss = ZINBLoss().cuda()
+        use_cuda = torch.cuda.is_available()
+        if use_cuda:
+            self.zinb_loss = ZINBLoss().cuda()
+        else: 
+            self.zinb_loss = ZINBLoss()
         self.args = args
 
         # Attention
@@ -144,9 +149,9 @@ class scDCC(nn.Module):
         for epoch in range(epochs):
             loss_avg = 0
             for batch_idx, (x_batch, x_raw_batch, sf_batch) in enumerate(dataloader):
-                x_tensor = Variable(x_batch).cuda()
-                x_raw_tensor = Variable(x_raw_batch).cuda()
-                sf_tensor = Variable(sf_batch).cuda()
+                x_tensor = Variable(x_batch)
+                x_raw_tensor = Variable(x_raw_batch)
+                sf_tensor = Variable(sf_batch)
                 _, _, mean_tensor, disp_tensor, pi_tensor = self.forward(x_tensor)
                 loss = self.zinb_loss(x=x_raw_tensor, mean=mean_tensor, disp=disp_tensor, pi=pi_tensor, scale_factor=sf_tensor)
                 loss_avg += loss
@@ -177,17 +182,28 @@ class scDCC(nn.Module):
         if use_cuda:
             self.cuda()
         print("Clustering stage")
-        X = torch.tensor(X).cuda()
-        X_raw = torch.tensor(X_raw).cuda()
-        sf = torch.tensor(sf).cuda()
+        X = torch.tensor(X)
+        X_raw = torch.tensor(X_raw)
+        sf = torch.tensor(sf)
         optimizer = optim.Adadelta(filter(lambda p: p.requires_grad, self.parameters()), lr=lr, rho=.95)
         print("Initializing cluster centers with kmeans.")
         kmeans = KMeans(self.n_clusters, n_init=20, random_state=0)
         data = self.encodeBatch(X)
+        
+        # open a file, where you ant to store the data
+        file = open('data_pre_kmeans.pickle', 'wb')
+        # dump information to that file
+        pickle.dump(data.data.cpu().numpy(), file)
+        
         self.y_pred = kmeans.fit_predict(data.data.cpu().numpy())
         self.y_pred_last = self.y_pred
         self.mu.data.copy_(torch.Tensor(kmeans.cluster_centers_))
         if y is not None:
+            
+            file = open('y_kmeans.pickle', 'wb')
+            # dump information to that file
+            pickle.dump(y, file)
+
             acc = np.round(cluster_acc(y, self.y_pred, os.path.join("results", self.args.dataset, self.args.name)), 5)
             nmi = np.round(metrics.normalized_mutual_info_score(y, self.y_pred), 5)
             ari = np.round(metrics.adjusted_rand_score(y, self.y_pred), 5)

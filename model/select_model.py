@@ -11,7 +11,7 @@ def select_model(args, input_size):
     if args.model == "scDCC":
         model = scDCC(input_dim=input_size, z_dim=32, n_clusters=args.n_clusters, 
                 encodeLayer=[256,64], decodeLayer=[64,256], sigma=args.sigma, gamma=args.gamma,
-                ml_weight=1., cl_weight=1., args= args).cuda()
+                ml_weight=1., cl_weight=1., args= args)
     if args.model == "scDCCRes":
         model = scDCCRes(input_dim=input_size, z_dim=32, n_clusters=8, 
                 encodeLayer=[256, 64], decodeLayer=[64, 256], sigma=args.sigma, gamma=args.gamma,

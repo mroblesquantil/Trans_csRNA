@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import matplotlib
+import pickle
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import sys
@@ -234,6 +235,11 @@ def generate_random_pair_from_embedding_clustering(latent_embedding, num, n_clus
                 if ind1 == l1 and ind2 == l2:
                     return True
         return False
+
+    ################################ GUARDAMOS EL ESPACIO LATENTE SOBRE EL QUE SE HACE EL KMEANS
+    print('Espacio latente:', latent_embedding)
+    file = open('latent_embedding.pickle', 'wb')
+    pickle.dump(latent_embedding, file)
 
     kmeans = KMeans(n_clusters=n_clusters, n_init=20)
     y_pred = kmeans.fit(latent_embedding).labels_

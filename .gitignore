@@ -3,3 +3,4 @@ cache/
 results/
 label_selected_cells_1.txt
 datos/
+Tests-GMM/results*
