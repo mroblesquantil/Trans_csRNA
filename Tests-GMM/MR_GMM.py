@@ -46,12 +46,18 @@ class scDCC(nn.Module):
         self._dec_pi = nn.Sequential(nn.Linear(decodeLayer[-1], input_dim), nn.Sigmoid())
         
         # Inicialización de parámetros para el clustering
-        self.mu = Parameter(torch.Tensor(n_clusters, z_dim))
-        self.pi = Parameter(torch.Tensor(n_clusters, 1))
+        self.mu = Parameter(torch.rand(n_clusters, z_dim, dtype = torch.float32))
+        self.pi = Parameter(torch.rand(n_clusters, 1, dtype = torch.float32))
+        self.diag_cov = Parameter(torch.rand(n_clusters, z_dim, dtype = torch.float32))
+
+        # self.register_parameter(name='mu', param=nn.Parameter(torch.Tensor(n_clusters, z_dim)))
+        # self.register_parameter(name='pi', param=nn.Parameter(torch.Tensor(n_clusters, 1)))
+        # self.register_parameter(name='diag_cov', param=nn.Parameter(torch.Tensor(n_clusters, z_dim)))
 
         # Los parámetros del clustering no se se actualizan en el pre train
-        self.pi.requires_grad = False 
-        self.mu.requires_grad = False 
+        # self.pi.requires_grad = False 
+        # self.mu.requires_grad = False 
+        # self.diag_cov.requires_grad = False
 
         # Funciones auxiliares: cálculo del ZINB loss y Softmax
         self.zinb_loss = ZINBLoss()
@@ -63,6 +69,7 @@ class scDCC(nn.Module):
 
         # Directorio en donde se guardan los resultados
         self.path = path 
+
     
     def forward(self, x):
         h = self.encoder(x+torch.randn_like(x) * self.sigma)
@@ -112,8 +119,11 @@ class scDCC(nn.Module):
                 mean_vec = mu[k,:]
                 cov_cluster = cov[k]
 
-                try: pdf = multivariate_normal(mean_vec, cov_cluster, allow_singular = True).pdf(Z_i)
-                except: pdf = multivariate_normal(mean_vec, np.identity(self.z_dim), allow_singular = True).pdf(Z_i)
+                try: 
+                    pdf = multivariate_normal(mean_vec, cov_cluster, allow_singular = True).pdf(Z_i)
+                except: 
+                    print('Except en el Clustering Loss')
+                    pdf = multivariate_normal(mean_vec, np.identity(self.z_dim), allow_singular = True).pdf(Z_i)
                 probab_i.append(pdf)
 
             probab.append(probab_i)
@@ -270,6 +280,7 @@ class scDCC(nn.Module):
 
         self.pi.requires_grad = True 
         self.mu.requires_grad = True 
+        self.diag_cov.requires_grad = True
         
         optimizer = optim.Adadelta(filter(lambda p: p.requires_grad, self.parameters()), lr=lr, rho=.95)
 
@@ -295,12 +306,15 @@ class scDCC(nn.Module):
             if epoch%update_interval == 0:
                 latent = self.encodeBatch(X)
                 
-                z = self.encodeBatch(X)
-                pi = torch.div(self.pi, torch.sum(self.pi)) # No se si esto está bien ponerlo acá
+                z = self.encodeBatch(X)        
+                pi = torch.where(self.pi.double() <= 0, 1/2100, self.pi.double())
+                pi = torch.div(pi, torch.sum(pi))
                     
                 if self.cov_identidad == False:
-                    phi = self.find_phi(z,self.mu,self.cov, pi)
-                    self.cov = self.find_covariance(z, self.mu, phi)
+                    #phi = self.find_phi(z,self.mu,self.cov, pi)
+                    diag = torch.where(self.diag_cov.double() <= 0, 1/2100, self.diag_cov.double())
+                    x = [torch.diag(diag.detach()[i]) for i in range(self.n_clusters)]
+                    self.cov = torch.stack(x) #self.find_covariance(z, self.mu, phi)
 
                 distr = self.find_probabilities(z,self.mu, self.cov)
                 self.y_pred = torch.argmax(torch.tensor(distr), dim=1).data.cpu().numpy()
@@ -320,14 +334,14 @@ class scDCC(nn.Module):
                             }, epoch+1, filename=save_dir)
                     
                 self.y_pred_last = self.y_pred
-                if epoch>0 and delta_label < tol:
+                # if epoch>0 and delta_label < tol:
                     
-                    with open(f'{self.path}/DATOS_DESPUES_KMEANS{epoch}.pickle', 'wb') as handle:
-                        pickle.dump( latent, handle)
+                #     with open(f'{self.path}/DATOS_DESPUES_KMEANS{epoch}.pickle', 'wb') as handle:
+                #         pickle.dump( latent, handle)
 
-                    print('delta_label ', delta_label, '< tol ', tol)
-                    print("Reach tolerance threshold. Stopping training.")
-                    break
+                #     print('delta_label ', delta_label, '< tol ', tol)
+                #     print("Reach tolerance threshold. Stopping training.")
+                #     break
             
             cluster_loss_val = 0
             recon_loss_val = 0
@@ -346,11 +360,14 @@ class scDCC(nn.Module):
                 z, meanbatch, dispbatch, pibatch = self.forward(inputs)
 
                 # Se normalizan los valores para pi
-                pi = torch.div(self.pi, torch.sum(self.pi)) # No se si esto está bien ponerlo acá
+                pi = torch.where(self.pi.double() <= 0, 1/2100, self.pi.double())
+                pi = torch.div(pi, torch.sum(pi)) 
+                
 
                 if self.cov_identidad == False:
-                    phi = self.find_phi(z,self.mu,self.cov, pi)
-                    self.cov = self.find_covariance(z, self.mu, phi)
+                    #phi = self.find_phi(z,self.mu,self.cov, self.pi)
+                    diag = torch.where(self.diag_cov.double() <= 0, 1/2100, self.diag_cov.double())
+                    self.cov = torch.stack([torch.diag(diag.detach()[i]) for i in range(self.n_clusters)]) #self.find_covariance(z, self.mu, phi)
 
                 cluster_loss = self.clustering_GMM_loss(z, cov=self.cov, mu=self.mu, pi = pi)
                 recon_loss = self.zinb_loss(rawinputs, meanbatch, dispbatch, pibatch, sfinputs)
@@ -360,10 +377,13 @@ class scDCC(nn.Module):
                 recon_loss_val += recon_loss * len(inputs)
                 train_loss = cluster_loss_val + recon_loss_val
                 
+                temp = self.mu.detach().numpy().copy()
                 loss.backward()
                 optimizer.step()
+                print('SON IGUALESSSSSS:', np.all(temp == self.mu.detach().numpy()))
+                print(self.pi)
                 
-            print("#Epoch %3d: Total: %.4f Clustering Loss: %.4f ZINB Loss: %.4f" % (
+            print("#Epoch %3d: Total: %.4f Clustering Loss: %.9f ZINB Loss: %.4f" % (
                 epoch + 1, train_loss / num, cluster_loss_val / num, recon_loss_val / num))            
             
             if epoch == num_epochs - 1: 

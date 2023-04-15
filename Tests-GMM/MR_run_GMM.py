@@ -28,7 +28,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', default=256, type=int)
     parser.add_argument('--data_file', default='data/Small_Datasets/10X_PBMC_select_2100.h5')
     parser.add_argument('--maxiter', default=200, type=int) ############## 200
-    parser.add_argument('--pretrain_epochs', default=300, type=int) ############# 300
+    parser.add_argument('--pretrain_epochs', default=1, type=int) ############# 300
     parser.add_argument('--gamma', default=1., type=float,
                         help='coefficient of clustering loss')
     parser.add_argument('--ml_weight', default=1., type=float,
@@ -47,10 +47,9 @@ if __name__ == "__main__":
     if cov_identidad:
         parser.add_argument('--path_results', default='results_MR_COVIdentidad/')
     else:
-        parser.add_argument('--path_results', default='results_MR_COVTry/')
+        parser.add_argument('--path_results', default='results_MR_COVDiagonal/') #  default='results_MR_COVTry/')
 
     args = parser.parse_args()
-    breakpoint()
 
     # Lectura de datos
     data_mat = h5py.File(args.data_file)
@@ -120,7 +119,7 @@ if __name__ == "__main__":
     # Segundo entrenamiento: clustering loss + ZINB loss
     y_pred,  mu, pi, cov, z, epochs = model.fit(X=adata.X, X_raw=adata.raw.X, sf=adata.obs.size_factors,  
                                     batch_size=args.batch_size,  num_epochs=args.maxiter,
-                                    update_interval=args.update_interval, tol=args.tol, save_dir=args.save_dir)
+                                    update_interval=args.update_interval, tol=args.tol, save_dir=args.save_dir, lr = 0.001)
     
     # Se guardan los resultados
     pd.DataFrame(z.detach().numpy()).to_csv(args.path_results + 'Z.csv')
