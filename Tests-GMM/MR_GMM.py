@@ -3,14 +3,17 @@ import pickle
 import math, os
 import numpy as np
 import torch.nn as nn
+from sklearn import metrics
 import torch.optim as optim
 from torch.nn import Parameter
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
 from torch.autograd import Variable
 from scipy.stats import multivariate_normal
-from layers import ZINBLoss, MeanAct, DispAct
+from layers import ZINBLoss, ClusteringLoss, MeanAct, DispAct
 from torch.utils.data import DataLoader, TensorDataset
+
+from utils import * 
 
 def buildNetwork(layers, type, activation="relu"):
     net = []
@@ -46,25 +49,17 @@ class scDCC(nn.Module):
         self._dec_pi = nn.Sequential(nn.Linear(decodeLayer[-1], input_dim), nn.Sigmoid())
         
         # Inicialización de parámetros para el clustering
-        self.mu = Parameter(torch.rand(n_clusters, z_dim, dtype = torch.float32))
-        self.pi = Parameter(torch.rand(n_clusters, 1, dtype = torch.float32))
-        self.diag_cov = Parameter(torch.rand(n_clusters, z_dim, dtype = torch.float32))
+        self.mu = Parameter(torch.rand(n_clusters, z_dim, dtype=torch.float32))
+        self.pi = Parameter(torch.rand(n_clusters, 1, dtype=torch.float32))
+        self.diag_cov = Parameter(torch.rand(n_clusters, z_dim, dtype=torch.float32))
 
-        # self.register_parameter(name='mu', param=nn.Parameter(torch.Tensor(n_clusters, z_dim)))
-        # self.register_parameter(name='pi', param=nn.Parameter(torch.Tensor(n_clusters, 1)))
-        # self.register_parameter(name='diag_cov', param=nn.Parameter(torch.Tensor(n_clusters, z_dim)))
-
-        # Los parámetros del clustering no se se actualizan en el pre train
-        # self.pi.requires_grad = False 
-        # self.mu.requires_grad = False 
-        # self.diag_cov.requires_grad = False
-
-        # Funciones auxiliares: cálculo del ZINB loss y Softmax
+        # Funciones auxiliares: cálculo del ZINB loss, Softmax y Clustering Loss
         self.zinb_loss = ZINBLoss()
         self.softmax = nn.Softmax(dim=1)
+        self.clustering_loss = ClusteringLoss()
 
         # Se guardan las covarianzas
-        self.cov = [np.identity(self.z_dim)]*self.n_clusters
+        self.cov = torch.Tensor([np.identity(self.z_dim)]*self.n_clusters)
         self.cov_identidad = cov_identidad
 
         # Directorio en donde se guardan los resultados
@@ -81,7 +76,9 @@ class scDCC(nn.Module):
 
         h0 = self.encoder(x)
         z0 = self._enc_mu(h0)
-        return z0, _mean, _disp, _pi 
+
+        prob_matrix = self.find_probabilities(z0)
+        return z0, _mean, _disp, _pi, prob_matrix
     
     def encodeBatch(self, X, batch_size=256):
         use_cuda = torch.cuda.is_available()
@@ -94,41 +91,53 @@ class scDCC(nn.Module):
         for batch_idx in range(num_batch):
             xbatch = X[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
             inputs = Variable(xbatch)
-            z, _, _, _ = self.forward(inputs)
+            z, _, _, _, _ = self.forward(inputs)
             encoded.append(z.data)
 
         encoded = torch.cat(encoded, dim=0)
         return encoded
 
-    def find_probabilities(self, Z, mu, cov):
+    def find_probabilities(self, Z):
         """
         Encuentra las probabilidades de cada punto a cada cluster a partir de las medias y las covarianzas.
         """
-        n_clus = self.n_clusters
-        Z = Z.detach().numpy()
-        mu = mu.detach().numpy()
         
-        probab = []
-        # Itero sobre los puntos
-        for i in range(Z.shape[0]):
-            Z_i = Z[i,:]
-            probab_i = []
-
-            # Itero sobre los cluster
-            for k in range(n_clus):
-                mean_vec = mu[k,:]
-                cov_cluster = cov[k]
-
-                try: 
-                    pdf = multivariate_normal(mean_vec, cov_cluster, allow_singular = True).pdf(Z_i)
-                except: 
-                    print('Except en el Clustering Loss')
-                    pdf = multivariate_normal(mean_vec, np.identity(self.z_dim), allow_singular = True).pdf(Z_i)
-                probab_i.append(pdf)
-
-            probab.append(probab_i)
+        try: proba = torch.exp(torch.distributions.MultivariateNormal(
+                    self.mu, self.cov).log_prob(Z.unsqueeze(1)))
+        except: breakpoint()
+                
+        # Normalizamos
+        proba = torch.div(proba,proba.sum(1).unsqueeze(-1))   
         
-        return probab
+        # Multiplicamos por pi
+        proba = torch.multiply(proba, nn.Softmax(dim=0)(self.pi).squeeze(1))
+
+        # Normalizamos 
+        proba = torch.where(proba < 0.00001, 0.00001, proba.double())
+
+
+        return proba
+    
+    def find_probabilities_identity(self, Z):
+        """
+        Encuentra las probabilidades de cada punto a cada cluster a partir de las medias y las covarianzas.
+        """
+        
+        cov =  torch.Tensor([np.identity(32)]*8)
+        try: proba = torch.exp(torch.distributions.MultivariateNormal(self.mu, 
+                            cov).log_prob(Z.unsqueeze(1)))
+        except: breakpoint()
+                
+        # Normalizamos
+        proba = torch.div(proba,proba.sum(1).unsqueeze(-1))   
+        
+        # Multiplicamos por pi
+        proba = torch.multiply(proba, nn.Softmax(dim=0)(self.pi).squeeze(1))
+
+        # Normalizamos 
+        proba = torch.where(proba < 0.00001, 0.00001, proba.double())
+
+        return proba
 
 
     def find_covariance(self, Z, mu, phi):
@@ -159,86 +168,12 @@ class scDCC(nn.Module):
             cov_mats.append(m)
         
         return cov_mats
-    
-    def clustering_GMM_loss(self, Z, pi, mu, cov):
-        """
-        Args: 
-            X: Matriz (n_puntos x d) con los puntos
-            pi: Vector (n_clusters) con los pesos de cada cluster
-            mu: Matriz (n_clusters x d) con las medias de cada cluster
-            cov_mats: Lista (n_clusters) con una matriz de covarianza por cada cluster 
-        Returns:
-            GMM loss
-        """
-        Z = Z.detach().numpy()
-        pi = pi.detach().numpy()
-        mu = mu.detach().numpy()
-
-        n_clus = self.n_clusters
-
-        # Itero sobre los puntos
-        res = []
-        for i in range(Z.shape[0]):
-            # Itero sobre los clusters
-            res_i = []
-            for k in range(n_clus):
-                cov_cluster = cov[k]
-                mean_vec = mu[k,:]
-                Z_i = Z[i,:]
-                
-                try: pdf = multivariate_normal(mean_vec, cov_cluster, allow_singular = True).pdf(Z_i)
-                except: 
-                    pdf = multivariate_normal(mean_vec, np.identity(self.z_dim), allow_singular = True).pdf(Z_i)
-
-                res_i.append(pi[k]*pdf)
-            
-            res.append(-np.log(np.sum(res_i) + 0.00001)) # La suma del epsilon es porque a veces da 0 y el loss queda en inf
-        
-        return np.sum(res)
-
-    def find_phi(self, Z, mu, cov, pi):
-        """
-        Calcula la matriz de phi
-        """
-        Z = Z.detach().numpy()
-        mu = mu.detach().numpy()
-        pi = pi.detach().numpy()
-
-        phi = np.zeros((Z.shape[0], self.n_clusters))
-        for i in range(Z.shape[0]):
-            for k in range(self.n_clusters):
-                denom = 0
-                for j in range(self.n_clusters):
-                    cov_mat = cov[j] 
-                    mean_vec = mu[j,:]
-                    Z_i = Z[i,:]
-                    try:
-                        pdf = multivariate_normal(mean_vec, cov_mat, allow_singular = True).pdf(Z_i)
-                    except:
-                        pdf = multivariate_normal(mean_vec, np.identity(self.z_dim), allow_singular = True).pdf(Z_i)
-
-                    denom += pi[j][0] * pdf
-
-                cov_mat = cov[k] 
-                mean_vec = mu[k,:]
-                Z_i = Z[i,:]
-                try:
-                    pdf = multivariate_normal(mean_vec, cov_mat, allow_singular = True).pdf(Z_i)
-                except:
-                    pdf = multivariate_normal(mean_vec, np.identity(self.z_dim), allow_singular = True).pdf(Z_i)
-
-
-                num = pi[k][0]*pdf
-
-                phi[i,k] = num/denom
-
-        return phi 
 
     def save_checkpoint(self, state, index, filename):
         newfilename = os.path.join(filename, 'FTcheckpoint_%d.pth.tar' % index)
         torch.save(state, newfilename)
 
-    def pretrain_autoencoder(self, x, X_raw, size_factor, batch_size=256, lr=0.001, epochs=400, ae_save=True, ae_weights='AE_weights.pth.tar'):
+    def pretrain_autoencoder(self, x, X_raw, size_factor, batch_size=256, lr=0.0001, epochs=400, ae_save=True, ae_weights='AE_weights.pth.tar'):
         use_cuda = torch.cuda.is_available()
         if use_cuda:
             self.cuda()
@@ -251,11 +186,14 @@ class scDCC(nn.Module):
                 x_tensor = Variable(x_batch)#.cuda()
                 x_raw_tensor = Variable(x_raw_batch)#.cuda()
                 sf_tensor = Variable(sf_batch)#.cuda()
-                _, mean_tensor, disp_tensor, pi_tensor = self.forward(x_tensor)
+                _, mean_tensor, disp_tensor, pi_tensor, prob_matrix = self.forward(x_tensor)
                 loss = self.zinb_loss(x=x_raw_tensor, mean=mean_tensor, disp=disp_tensor, pi=pi_tensor, scale_factor=sf_tensor)
+                
+                #temp = self.mu.detach().numpy().copy()
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                
                 print('Pretrain epoch [{}/{}], ZINB loss:{:.4f}'.format(batch_idx+1, epoch+1, loss.item()))
         
         if ae_save:
@@ -266,7 +204,7 @@ class scDCC(nn.Module):
         newfilename = os.path.join(filename, 'FTcheckpoint_%d.pth.tar' % index)
         torch.save(state, newfilename)
 
-    def fit(self, X, X_raw, sf, lr=1., batch_size=256, num_epochs=10, update_interval=1, tol=1e-3, save_dir=''):
+    def fit(self, X, X_raw, sf, lr=0.1, batch_size=256, num_epochs=10, update_interval=1, tol=1e-3, save_dir='', y = None):
         '''X: tensor data'''
         use_cuda = torch.cuda.is_available()
         if use_cuda:
@@ -277,10 +215,6 @@ class scDCC(nn.Module):
         X = torch.tensor(X)#.cuda()
         X_raw = torch.tensor(X_raw)#.cuda()
         sf = torch.tensor(sf)#.cuda()
-
-        self.pi.requires_grad = True 
-        self.mu.requires_grad = True 
-        self.diag_cov.requires_grad = True
         
         optimizer = optim.Adadelta(filter(lambda p: p.requires_grad, self.parameters()), lr=lr, rho=.95)
 
@@ -294,11 +228,16 @@ class scDCC(nn.Module):
 
         self.y_pred = kmeans.fit_predict(data.data.cpu().numpy())
         self.y_pred_last = self.y_pred
+
         self.mu.data.copy_(torch.Tensor(kmeans.cluster_centers_))
         
         self.train()
         num = X.shape[0]
         num_batch = int(math.ceil(1.0*X.shape[0]/batch_size))
+
+        clustering_metrics = {'ac': [], 'nmi': [], 'ari': []}
+        clustering_metrics_id = {'ac': [], 'nmi': [], 'ari': []}
+        losses = {'zinb': [], 'gmm': []}
 
         for epoch in range(num_epochs):
             print(f"---> Epoca {epoch}")
@@ -307,16 +246,14 @@ class scDCC(nn.Module):
                 latent = self.encodeBatch(X)
                 
                 z = self.encodeBatch(X)        
-                pi = torch.where(self.pi.double() <= 0, 1/2100, self.pi.double())
-                pi = torch.div(pi, torch.sum(pi))
+
                     
                 if self.cov_identidad == False:
-                    #phi = self.find_phi(z,self.mu,self.cov, pi)
                     diag = torch.where(self.diag_cov.double() <= 0, 1/2100, self.diag_cov.double())
                     x = [torch.diag(diag.detach()[i]) for i in range(self.n_clusters)]
-                    self.cov = torch.stack(x) #self.find_covariance(z, self.mu, phi)
+                    self.cov = torch.stack(x)
 
-                distr = self.find_probabilities(z,self.mu, self.cov)
+                distr = self.find_probabilities(z)
                 self.y_pred = torch.argmax(torch.tensor(distr), dim=1).data.cpu().numpy()
 
                 # check stop criterion
@@ -329,7 +266,7 @@ class scDCC(nn.Module):
                             'mu': self.mu,
                             'y_pred': self.y_pred,
                             'z': z,
-                            'pi': pi,
+                            'pi': self.pi,
                             'cov': self.cov,
                             }, epoch+1, filename=save_dir)
                     
@@ -352,42 +289,72 @@ class scDCC(nn.Module):
                 xrawbatch = X_raw[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
                 sfbatch = sf[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
 
-                optimizer.zero_grad()
                 inputs = Variable(xbatch)
                 rawinputs = Variable(xrawbatch)
                 sfinputs = Variable(sfbatch)
 
-                z, meanbatch, dispbatch, pibatch = self.forward(inputs)
+                z, meanbatch, dispbatch, pibatch, prob_matrixbatch = self.forward(inputs) 
 
-                # Se normalizan los valores para pi
-                pi = torch.where(self.pi.double() <= 0, 1/2100, self.pi.double())
-                pi = torch.div(pi, torch.sum(pi)) 
-                
 
                 if self.cov_identidad == False:
-                    #phi = self.find_phi(z,self.mu,self.cov, self.pi)
                     diag = torch.where(self.diag_cov.double() <= 0, 1/2100, self.diag_cov.double())
-                    self.cov = torch.stack([torch.diag(diag.detach()[i]) for i in range(self.n_clusters)]) #self.find_covariance(z, self.mu, phi)
+                    self.cov = torch.stack([torch.diag(diag.detach()[i]) for i in range(self.n_clusters)]) 
 
-                cluster_loss = self.clustering_GMM_loss(z, cov=self.cov, mu=self.mu, pi = pi)
+                cluster_loss = self.clustering_loss(prob_matrixbatch)
                 recon_loss = self.zinb_loss(rawinputs, meanbatch, dispbatch, pibatch, sfinputs)
                 loss = cluster_loss + recon_loss
                 
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
                 cluster_loss_val += cluster_loss * len(inputs)
                 recon_loss_val += recon_loss * len(inputs)
                 train_loss = cluster_loss_val + recon_loss_val
                 
-                temp = self.mu.detach().numpy().copy()
-                loss.backward()
-                optimizer.step()
-                print('SON IGUALESSSSSS:', np.all(temp == self.mu.detach().numpy()))
-                print(self.pi)
                 
             print("#Epoch %3d: Total: %.4f Clustering Loss: %.9f ZINB Loss: %.4f" % (
-                epoch + 1, train_loss / num, cluster_loss_val / num, recon_loss_val / num))            
+                epoch + 1, train_loss / num, cluster_loss_val / num, recon_loss_val / num))      
+
+            losses['zinb'].append(recon_loss_val / num)
+            losses['gmm'].append(cluster_loss_val / num)
+
             
             if epoch == num_epochs - 1: 
                 with open(f'{self.path}/DATOS_DESPUES_KMEANS{epoch}.pickle', 'wb') as handle:
                     pickle.dump( latent, handle)
-               
-        return self.y_pred, self.mu, self.pi, self.cov, z, epoch
+
+            if not y is None:
+                z = self.encodeBatch(X)        
+                distr = self.find_probabilities(z)
+                self.y_pred = torch.argmax(torch.tensor(distr), dim=1).data.cpu().numpy()
+
+                accuracy = np.round(cluster_acc(y_true = y, y_pred = self.y_pred), 5)
+                nmi = np.round(metrics.normalized_mutual_info_score(y, self.y_pred), 5)
+                ari = np.round(metrics.adjusted_rand_score(y, self.y_pred), 5)
+
+                clustering_metrics['ac'].append(accuracy)
+                clustering_metrics['nmi'].append(nmi)
+                clustering_metrics['ari'].append(ari)
+
+                distr = self.find_probabilities_identity(z)
+                y_pred_identity = torch.argmax(torch.tensor(distr), dim=1).data.cpu().numpy()
+
+                accuracy = np.round(cluster_acc(y_true = y, y_pred = y_pred_identity), 5)
+                nmi = np.round(metrics.normalized_mutual_info_score(y, y_pred_identity), 5)
+                ari = np.round(metrics.adjusted_rand_score(y, y_pred_identity), 5)
+
+                clustering_metrics_id['ac'].append(accuracy)
+                clustering_metrics_id['nmi'].append(nmi)
+                clustering_metrics_id['ari'].append(ari)
+        
+            with open(self.path + '/clustering_metrics.pickle', 'wb') as handle:
+                pickle.dump( clustering_metrics, handle)
+
+            with open(self.path + '/clustering_metrics_id.pickle', 'wb') as handle:
+                pickle.dump( clustering_metrics_id, handle)
+
+            with open(self.path + '/losses.pickle', 'wb') as handle:
+                pickle.dump( losses, handle)
+
+        return self.y_pred, self.mu, self.pi, self.cov, z, epoch, clustering_metrics, clustering_metrics_id, losses

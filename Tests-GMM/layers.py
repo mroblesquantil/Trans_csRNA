@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from scipy.stats import multivariate_normal
 
 
 class ZINBLoss(nn.Module):
@@ -29,6 +30,19 @@ class ZINBLoss(nn.Module):
         result = torch.mean(result)
         return result
 
+class ClusteringLoss(nn.Module):
+    def __init__(self):
+        super(ClusteringLoss, self).__init__()
+
+    def forward(self, probMatrix):
+        """
+        Args: 
+           TODO
+        Returns:
+            GMM loss
+        """
+        rta = -(torch.log(probMatrix.sum(1)).sum())/1000
+        return rta
 
 class GaussianNoise(nn.Module):
     def __init__(self, sigma=0):
