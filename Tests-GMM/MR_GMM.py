@@ -51,12 +51,12 @@ class scDCC(nn.Module):
         # Inicialización de parámetros para el clustering
         self.mu = Parameter(torch.rand(n_clusters, z_dim, dtype=torch.float32))
         self.pi = Parameter(torch.rand(n_clusters, 1, dtype=torch.float32))
-        self.diag_cov = Parameter(torch.rand(n_clusters, z_dim, dtype=torch.float32))
+        self.diag_cov = Parameter(torch.ones(n_clusters, z_dim, dtype=torch.float32))
 
         # Funciones auxiliares: cálculo del ZINB loss, Softmax y Clustering Loss
-        self.zinb_loss = ZINBLoss()
+        self.zinb_loss = ZINBLoss().cuda()
         self.softmax = nn.Softmax(dim=1)
-        self.clustering_loss = ClusteringLoss()
+        self.clustering_loss = ClusteringLoss().cuda()
 
         # Se guardan las covarianzas
         self.cov = torch.Tensor([np.identity(self.z_dim)]*self.n_clusters)
@@ -101,19 +101,24 @@ class scDCC(nn.Module):
         """
         Encuentra las probabilidades de cada punto a cada cluster a partir de las medias y las covarianzas.
         """
-        
-        try: proba = torch.exp(torch.distributions.MultivariateNormal(
-                    self.mu, self.cov).log_prob(Z.unsqueeze(1)))
+        try: proba = torch.distributions.MultivariateNormal(self.mu, self.cov).log_prob(Z.unsqueeze(1))
         except: breakpoint()
-                
+
+        # Se resta el maximo número (en logaritmo)
+        maximum = torch.max(proba,dim=1)[0]
+        proba = proba - maximum[:,None]  
+
+        # Se convierte a probabilidades
+        proba = torch.exp(proba) 
+
         # Normalizamos
         proba = torch.div(proba,proba.sum(1).unsqueeze(-1))   
         
         # Multiplicamos por pi
         proba = torch.multiply(proba, nn.Softmax(dim=0)(self.pi).squeeze(1))
 
-        # Normalizamos 
-        proba = torch.where(proba < 0.00001, 0.00001, proba.double())
+        # Completamos los 0s
+        proba = torch.where(proba < 10**(-10), 10**(-10), proba.double())
 
 
         return proba
@@ -181,12 +186,14 @@ class scDCC(nn.Module):
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         print("Pretraining stage")
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=lr, amsgrad=True)
+        
+        loss_s = []
         for epoch in range(epochs):
             for batch_idx, (x_batch, x_raw_batch, sf_batch) in enumerate(dataloader):
-                x_tensor = Variable(x_batch)#.cuda()
-                x_raw_tensor = Variable(x_raw_batch)#.cuda()
-                sf_tensor = Variable(sf_batch)#.cuda()
-                _, mean_tensor, disp_tensor, pi_tensor, prob_matrix = self.forward(x_tensor)
+                x_tensor = Variable(x_batch).cuda()
+                x_raw_tensor = Variable(x_raw_batch).cuda()
+                sf_tensor = Variable(sf_batch).cuda()
+                _, mean_tensor, disp_tensor, pi_tensor, _ = self.forward(x_tensor)
                 loss = self.zinb_loss(x=x_raw_tensor, mean=mean_tensor, disp=disp_tensor, pi=pi_tensor, scale_factor=sf_tensor)
                 
                 #temp = self.mu.detach().numpy().copy()
@@ -195,10 +202,19 @@ class scDCC(nn.Module):
                 optimizer.step()
                 
                 print('Pretrain epoch [{}/{}], ZINB loss:{:.4f}'.format(batch_idx+1, epoch+1, loss.item()))
-        
-        if ae_save:
-            torch.save({'ae_state_dict': self.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict()}, ae_weights)
+                loss_s.append(loss.item())
+            
+            with open(self.path + '/pretrain_loss.pickle', 'wb') as handle:
+                pickle.dump(loss_s, handle)
+
+        torch.save({'ae_state_dict': self.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict()}, ae_weights)
+
+
+        # Save the pretrained model 
+        f = open(self.path + f'pretrained_model_with_{epoch}_epochs.pickle', 'wb')
+        pickle.dump(self, f)
+        f.close 
 
     def save_checkpoint(self, state, index, filename):
         newfilename = os.path.join(filename, 'FTcheckpoint_%d.pth.tar' % index)
@@ -206,16 +222,21 @@ class scDCC(nn.Module):
 
     def fit(self, X, X_raw, sf, lr=0.1, batch_size=256, num_epochs=10, update_interval=1, tol=1e-3, save_dir='', y = None):
         '''X: tensor data'''
+        
         use_cuda = torch.cuda.is_available()
         if use_cuda:
             self.cuda()
 
         save_dir = self.path +'/'
         print("Clustering stage")
-        X = torch.tensor(X)#.cuda()
-        X_raw = torch.tensor(X_raw)#.cuda()
-        sf = torch.tensor(sf)#.cuda()
+        X = torch.tensor(X).cuda()
+        X_raw = torch.tensor(X_raw).cuda()
+        sf = torch.tensor(sf).cuda()
         
+        diag = torch.where(self.diag_cov.double() <= 0, 1/2100, self.diag_cov.double())
+        x = [torch.diag(diag.detach()[i]) for i in range(self.n_clusters)]
+        self.cov = torch.stack(x).cuda()
+
         optimizer = optim.Adadelta(filter(lambda p: p.requires_grad, self.parameters()), lr=lr, rho=.95)
 
         print("Initializing cluster centers with kmeans.")
@@ -245,13 +266,11 @@ class scDCC(nn.Module):
             if epoch%update_interval == 0:
                 latent = self.encodeBatch(X)
                 
-                z = self.encodeBatch(X)        
+                z = self.encodeBatch(X)
 
-                    
-                if self.cov_identidad == False:
-                    diag = torch.where(self.diag_cov.double() <= 0, 1/2100, self.diag_cov.double())
-                    x = [torch.diag(diag.detach()[i]) for i in range(self.n_clusters)]
-                    self.cov = torch.stack(x)
+                diag = torch.where(self.diag_cov.double() <= 0, 1/2100, self.diag_cov.double())
+                x = [torch.diag(diag.detach()[i]) for i in range(self.n_clusters)]
+                self.cov = torch.stack(x).cuda() 
 
                 distr = self.find_probabilities(z)
                 self.y_pred = torch.argmax(torch.tensor(distr), dim=1).data.cpu().numpy()
@@ -285,6 +304,7 @@ class scDCC(nn.Module):
             train_loss = 0
             # train 1 epoch for clustering loss
             for batch_idx in range(num_batch):
+
                 xbatch = X[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
                 xrawbatch = X_raw[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
                 sfbatch = sf[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
@@ -293,20 +313,28 @@ class scDCC(nn.Module):
                 rawinputs = Variable(xrawbatch)
                 sfinputs = Variable(sfbatch)
 
+                #if self.cov_identidad == False:
+                diag = torch.where(self.diag_cov.double() <= 0, 1/2100, self.diag_cov.double())
+                self.cov = torch.stack([torch.diag(diag.detach()[i]) for i in range(self.n_clusters)]).cuda()
+
                 z, meanbatch, dispbatch, pibatch, prob_matrixbatch = self.forward(inputs) 
-
-
-                if self.cov_identidad == False:
-                    diag = torch.where(self.diag_cov.double() <= 0, 1/2100, self.diag_cov.double())
-                    self.cov = torch.stack([torch.diag(diag.detach()[i]) for i in range(self.n_clusters)]) 
 
                 cluster_loss = self.clustering_loss(prob_matrixbatch)
                 recon_loss = self.zinb_loss(rawinputs, meanbatch, dispbatch, pibatch, sfinputs)
+                
                 loss = cluster_loss + recon_loss
                 
                 optimizer.zero_grad()
                 loss.backward()
+                # torch.nn.utils.clip_grad_value_(self.parameters(), 0)
+
                 optimizer.step()
+
+                # fig, axes = plt.subplots(nrows=2, ncols = 4, figsize = (30,10), sharex = True, sharey = True)
+                # for r in range(2):
+                #     for c in range(4):
+                #         axes[r][c].hist(self.mu.detach().numpy()[r*4 + c], alpha = 0.7) 
+                # plt.show()
 
                 cluster_loss_val += cluster_loss * len(inputs)
                 recon_loss_val += recon_loss * len(inputs)

@@ -6,3 +6,4 @@ datos/
 Tests-GMM/results*
 data/
 *.tar
+*.csv

@@ -26,9 +26,9 @@ if __name__ == "__main__":
     parser.add_argument('--n_pairwise', default=0, type=int)
     parser.add_argument('--n_pairwise_error', default=0, type=float)
     parser.add_argument('--batch_size', default=256, type=int)
-    parser.add_argument('--data_file', default='data/Small_Datasets/10X_PBMC_select_2100.h5') #default='data/Small_Datasets/10X_PBMC_select_2100.h5')
-    parser.add_argument('--maxiter', default=500, type=int) ############## 200
-    parser.add_argument('--pretrain_epochs', default=20, type=int) ############# 300
+    parser.add_argument('--data_file', default='data/Small_Datasets/Macosko_mouse_retina.h5') #default='data/Small_Datasets/10X_PBMC_select_2100.h5')
+    parser.add_argument('--maxiter', default=150, type=int) ############## 200
+    parser.add_argument('--pretrain_epochs', default=400, type=int) ############# 300
     parser.add_argument('--gamma', default=1., type=float,
                         help='coefficient of clustering loss')
     parser.add_argument('--ml_weight', default=1., type=float,
@@ -44,7 +44,7 @@ if __name__ == "__main__":
     # Argumentos de GMM
     cov_identidad = False # Se mantiene la covarianza como la identidad en todos los casos
     parser.add_argument('--cov_identidad', default = cov_identidad)
-    parser.add_argument('--path_results', default='results/10x_PBMC/')
+    parser.add_argument('--path_results', default='results/Macosko_mouse_retina_14_06/')
 
     args = parser.parse_args()
 
@@ -53,6 +53,8 @@ if __name__ == "__main__":
     x = np.array(data_mat['X'])
     y = np.array(data_mat['Y'])
     data_mat.close()
+
+    args.n_clusters 
 
     # preprocesamiento scRNA-seq read counts matrix
     adata = sc.AnnData(x)
@@ -90,7 +92,7 @@ if __name__ == "__main__":
     # Creación del modelo (sin el valor final de y, sin most links)
     model = scDCC(input_dim=adata.n_vars, z_dim=32, n_clusters=args.n_clusters, 
                 encodeLayer=[256, 64], decodeLayer=[64, 256], sigma=sd, gamma=args.gamma,
-                cov_identidad = args.cov_identidad, path = args.path_results) 
+                cov_identidad = args.cov_identidad, path = args.path_results).cuda()
     
     print(str(model))
 
