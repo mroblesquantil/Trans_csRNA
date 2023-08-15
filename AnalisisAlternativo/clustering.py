@@ -61,8 +61,8 @@ def model_DBSCAN(X, y,
                 max_acc_e_m = e, m
                 best_model = dbscan
     
-    ari = adjusted_rand_score(y, best_model.predict(X))
-    nmi = normalized_mutual_info_score(y, best_model.predict(X)) 
+    ari = adjusted_rand_score(y, best_model.labels_)
+    nmi = normalized_mutual_info_score(y, best_model.labels_) 
     
     metrics = {'Accuracy': max_acc, 'ARI': ari, 'NMI': nmi}
 
@@ -70,8 +70,8 @@ def model_DBSCAN(X, y,
 
 
 def model_BIRCH(X, y, 
-                threshold: [0.1, 0.5, 1.0, 2.0, 5.0, 10.0], 
-                branching_factor: [10, 50, 100, 150]
+                threshold = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0], 
+                branching_factor =  [10, 50, 100, 150]
                 ):
     # Define los hiperparámetros a ajustar
     param_grid = {
@@ -105,7 +105,7 @@ def model_BIRCH(X, y,
 
 def model_KMeans(X, y):
     n_clusters = len(set(y))
-    
+
     kmeans_model = KMeans(n_clusters=n_clusters)
     kmeans_model.fit(X)
     labels = kmeans_model.predict(X)
